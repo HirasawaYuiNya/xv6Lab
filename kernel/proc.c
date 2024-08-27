@@ -16,31 +16,10 @@ int nextpid = 1;
 struct spinlock pid_lock;
 
 extern void forkret(void);
+static void wakeup1(struct proc *chan);
 static void freeproc(struct proc *p);
 
 extern char trampoline[]; // trampoline.S
-
-// helps ensure that wakeups of wait()ing
-// parents are not lost. helps obey the
-// memory model when using p->parent.
-// must be acquired before any p->lock.
-struct spinlock wait_lock;
-
-// Allocate a page for each process's kernel stack.
-// Map it high in memory, followed by an invalid
-// guard page.
-void
-proc_mapstacks(pagetable_t kpgtbl) {
-  struct proc *p;
-  
-  for(p = proc; p < &proc[NPROC]; p++) {
-    char *pa = kalloc();
-    if(pa == 0)
-      panic("kalloc");
-    uint64 va = KSTACK((int) (p - proc));
-    kvmmap(kpgtbl, va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
-  }
-}
 
 // initialize the proc table at boot time.
 void
@@ -49,11 +28,20 @@ procinit(void)
   struct proc *p;
   
   initlock(&pid_lock, "nextpid");
-  initlock(&wait_lock, "wait_lock");
   for(p = proc; p < &proc[NPROC]; p++) {
       initlock(&p->lock, "proc");
-      p->kstack = KSTACK((int) (p - proc));
+
+      // // Allocate a page for the process's kernel stack.
+      // // Map it high in memory, followed by an invalid
+      // // guard page.
+      // char *pa = kalloc();
+      // if(pa == 0)
+      //   panic("kalloc");
+      // uint64 va = KSTACK((int) (p - proc));
+      // kvmmap(va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
+      // p->kstack = va;
   }
+  kvminithart();
 }
 
 // Must be called with interrupts disabled,
@@ -106,6 +94,7 @@ allocproc(void)
 {
   struct proc *p;
 
+
   for(p = proc; p < &proc[NPROC]; p++) {
     acquire(&p->lock);
     if(p->state == UNUSED) {
@@ -118,25 +107,14 @@ allocproc(void)
 
 found:
   p->pid = allocpid();
-  p->state = USED;
 
-  // Allocate a trapframe page.(用于保存进程上下文的页面。)
+  // Allocate a trapframe page.
   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
-    freeproc(p);
     release(&p->lock);
     return 0;
   }
 
-  // Allocate a usyscall page.
-  if ((p->usyscallpage = (struct usyscall *)kalloc()) == 0) {
-    freeproc(p);
-    release(&p->lock);
-    return 0;
-  }
-
-  p->usyscallpage->pid = p->pid;
-
-  // An empty user page table.(为进程分配一个用户页表。)
+  // An empty user page table.
   p->pagetable = proc_pagetable(p);
   if(p->pagetable == 0){
     freeproc(p);
@@ -144,9 +122,29 @@ found:
     return 0;
   }
 
+  // 创建进程时，为进程分配内核栈和页表映射
+  p->k_pagetable1 = proc_kvm_init();
+  if (p->k_pagetable1 == 0)
+  {
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+  // 初始化当前内核页表的内核栈
+  // 分配一页物理内存
+  char *pa = kalloc();
+  if (pa == 0)
+    panic("kalloc");
+  //计算当前进程的虚拟地址 va，用于将新分配的物理内存映射到内核栈区域
+  uint64 va = KSTACK((int)(p - proc));
+  //将新分配的物理内存 pa 映射到进程的内核栈区域的虚拟地址 va
+  //并设置相关的权限标志，允许读写操作
+  proc_kvmmap(p->k_pagetable1, va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
+  //将进程的 kstack 字段设置为新分配的内核栈的虚拟地址
+  p->kstack = va;
+
   // Set up new context to start executing at forkret,
   // which returns to user space.
-  // 设置了新进程的上下文，以便在进程切换时返回到用户空间。
   memset(&p->context, 0, sizeof(p->context));
   p->context.ra = (uint64)forkret;
   p->context.sp = p->kstack + PGSIZE;
@@ -157,20 +155,74 @@ found:
 // free a proc structure and the data hanging from it,
 // including user pages.
 // p->lock must be held.
+// static void
+// freeproc(struct proc *p)
+// {
+//   if(p->trapframe)
+//     kfree((void*)p->trapframe);
+//   p->trapframe = 0;
+//   if(p->pagetable)
+//     proc_freepagetable(p->pagetable, p->sz);
+//   p->pagetable = 0;
+//   p->sz = 0;
+//   p->pid = 0;
+//   p->parent = 0;
+//   p->name[0] = 0;
+//   p->chan = 0;
+//   p->killed = 0;
+//   p->xstate = 0;
+//   p->state = UNUSED;
+// }
+
+// 递归地释放进程的内核页表和内核虚拟地址空间所占用的资源
+void kvm_free_pgtb1(pagetable_t pg){
+  for (int i = 0; i < 512; i++){
+    //获取当前遍历到的页表项
+    pte_t pte = pg[i];
+
+    // 判断当前页表项是否有效且没有被标记为可读、可写或可执行
+    // 如果满足条件，则说明该页表项对应的页表是一个有效且没有被使用的子页表
+    if((pte & PTE_V) && (pte & (PTE_R|PTE_W|PTE_X)) == 0){
+      kvm_free_pgtb1((pagetable_t)PTE2PA(pte));
+      pg[i] = 0;
+    } 
+  }
+  kfree((void*)pg);
+  }
+
+
 static void
 freeproc(struct proc *p)
 {
   if(p->trapframe)
     kfree((void*)p->trapframe);
   p->trapframe = 0;
+  // if(p->pagetable)
+  //   proc_freepagetable(p->pagetable, p->sz);
+  // p->pagetable = 0;
+  
+  // 释放一个进程所占用的资源，包括内核栈、用户页表以及内核页表
+  if (p->kstack)
+  {
+    pte_t *pte = walk(p->k_pagetable1, p->kstack, 0);//walk() 函数用于在页表中进行页表项查找
+    if (pte == 0)
+      panic("freeproc: kstack"); //如果找不到与内核栈地址相关的页表项，表示存在错误
+    kfree((void *)PTE2PA(*pte)); //将页表项转换为物理地址，并释放内核栈占用的物理内存。
+  }
+  p->kstack = 0; //表示内核栈已经被释放
 
-  if(p->usyscallpage)
-    kfree((void *)p->usyscallpage);
-  p->usyscallpage = 0;
-
-  if(p->pagetable)
+  //释放进程的用户页表
+  if (p->pagetable)
     proc_freepagetable(p->pagetable, p->sz);
   p->pagetable = 0;
+
+  //释放进程的内核页表
+  if (p->k_pagetable1)
+  {
+    kvm_free_pgtb1(p->k_pagetable1);
+  }
+  p->k_pagetable1 = 0;
+
   p->sz = 0;
   p->pid = 0;
   p->parent = 0;
@@ -179,6 +231,7 @@ freeproc(struct proc *p)
   p->killed = 0;
   p->xstate = 0;
   p->state = UNUSED;
+  
 }
 
 // Create a user page table for a given process,
@@ -192,12 +245,6 @@ proc_pagetable(struct proc *p)
   pagetable = uvmcreate();
   if(pagetable == 0)
     return 0;
-
-  if(mappages(pagetable, USYSCALL, PGSIZE, 
-              (uint64)(p->usyscallpage), PTE_R | PTE_U) < 0) {
-    uvmfree(pagetable, 0);
-    return 0;
-  }
 
   // map the trampoline code (for system call return)
   // at the highest user virtual address.
@@ -227,7 +274,6 @@ proc_freepagetable(pagetable_t pagetable, uint64 sz)
 {
   uvmunmap(pagetable, TRAMPOLINE, 1, 0);
   uvmunmap(pagetable, TRAPFRAME, 1, 0);
-  uvmunmap(pagetable, USYSCALL, 1, 0);
   uvmfree(pagetable, sz);
 }
 
@@ -257,6 +303,8 @@ userinit(void)
   uvminit(p->pagetable, initcode, sizeof(initcode));
   p->sz = PGSIZE;
 
+  uvm_mapto_kvm(p->pagetable, p->k_pagetable1, 0, p->sz);
+
   // prepare for the very first "return" from kernel to user.
   p->trapframe->epc = 0;      // user program counter
   p->trapframe->sp = PGSIZE;  // user stack pointer
@@ -285,6 +333,7 @@ growproc(int n)
   } else if(n < 0){
     sz = uvmdealloc(p->pagetable, sz, sz + n);
   }
+  uvm_mapto_kvm(p->pagetable, p->k_pagetable1, sz - n, sz);
   p->sz = sz;
   return 0;
 }
@@ -311,6 +360,10 @@ fork(void)
   }
   np->sz = p->sz;
 
+  uvm_mapto_kvm(np->pagetable, np->k_pagetable1, 0, np->sz);
+
+  np->parent = p;
+
   // copy saved user registers.
   *(np->trapframe) = *(p->trapframe);
 
@@ -327,30 +380,35 @@ fork(void)
 
   pid = np->pid;
 
-  release(&np->lock);
-
-  acquire(&wait_lock);
-  np->parent = p;
-  release(&wait_lock);
-
-  acquire(&np->lock);
   np->state = RUNNABLE;
+
   release(&np->lock);
 
   return pid;
 }
 
 // Pass p's abandoned children to init.
-// Caller must hold wait_lock.
+// Caller must hold p->lock.
 void
 reparent(struct proc *p)
 {
   struct proc *pp;
 
   for(pp = proc; pp < &proc[NPROC]; pp++){
+    // this code uses pp->parent without holding pp->lock.
+    // acquiring the lock first could cause a deadlock
+    // if pp or a child of pp were also in exit()
+    // and about to try to lock p.
     if(pp->parent == p){
+      // pp->parent can't change between the check and the acquire()
+      // because only the parent changes it, and we're the parent.
+      acquire(&pp->lock);
       pp->parent = initproc;
-      wakeup(initproc);
+      // we should wake up init here, but that would require
+      // initproc->lock, which would be a deadlock, since we hold
+      // the lock on one of init's children (pp). this is why
+      // exit() always wakes init (before acquiring any locks).
+      release(&pp->lock);
     }
   }
 }
@@ -380,20 +438,41 @@ exit(int status)
   end_op();
   p->cwd = 0;
 
-  acquire(&wait_lock);
+  // we might re-parent a child to init. we can't be precise about
+  // waking up init, since we can't acquire its lock once we've
+  // acquired any other proc lock. so wake up init whether that's
+  // necessary or not. init may miss this wakeup, but that seems
+  // harmless.
+  acquire(&initproc->lock);
+  wakeup1(initproc);
+  release(&initproc->lock);
+
+  // grab a copy of p->parent, to ensure that we unlock the same
+  // parent we locked. in case our parent gives us away to init while
+  // we're waiting for the parent lock. we may then race with an
+  // exiting parent, but the result will be a harmless spurious wakeup
+  // to a dead or wrong process; proc structs are never re-allocated
+  // as anything else.
+  acquire(&p->lock);
+  struct proc *original_parent = p->parent;
+  release(&p->lock);
+  
+  // we need the parent's lock in order to wake it up from wait().
+  // the parent-then-child rule says we have to lock it first.
+  acquire(&original_parent->lock);
+
+  acquire(&p->lock);
 
   // Give any children to init.
   reparent(p);
 
   // Parent might be sleeping in wait().
-  wakeup(p->parent);
-  
-  acquire(&p->lock);
+  wakeup1(original_parent);
 
   p->xstate = status;
   p->state = ZOMBIE;
 
-  release(&wait_lock);
+  release(&original_parent->lock);
 
   // Jump into the scheduler, never to return.
   sched();
@@ -409,16 +488,21 @@ wait(uint64 addr)
   int havekids, pid;
   struct proc *p = myproc();
 
-  acquire(&wait_lock);
+  // hold p->lock for the whole time to avoid lost
+  // wakeups from a child's exit().
+  acquire(&p->lock);
 
   for(;;){
     // Scan through table looking for exited children.
     havekids = 0;
     for(np = proc; np < &proc[NPROC]; np++){
+      // this code uses np->parent without holding np->lock.
+      // acquiring the lock first would cause a deadlock,
+      // since np might be an ancestor, and we already hold p->lock.
       if(np->parent == p){
-        // make sure the child isn't still in exit() or swtch().
+        // np->parent can't change between the check and the acquire()
+        // because only the parent changes it, and we're the parent.
         acquire(&np->lock);
-
         havekids = 1;
         if(np->state == ZOMBIE){
           // Found one.
@@ -426,12 +510,12 @@ wait(uint64 addr)
           if(addr != 0 && copyout(p->pagetable, addr, (char *)&np->xstate,
                                   sizeof(np->xstate)) < 0) {
             release(&np->lock);
-            release(&wait_lock);
+            release(&p->lock);
             return -1;
           }
           freeproc(np);
           release(&np->lock);
-          release(&wait_lock);
+          release(&p->lock);
           return pid;
         }
         release(&np->lock);
@@ -440,12 +524,12 @@ wait(uint64 addr)
 
     // No point waiting if we don't have any children.
     if(!havekids || p->killed){
-      release(&wait_lock);
+      release(&p->lock);
       return -1;
     }
     
     // Wait for a child to exit.
-    sleep(p, &wait_lock);  //DOC: wait-sleep
+    sleep(p, &p->lock);  //DOC: wait-sleep
   }
 }
 
@@ -466,7 +550,8 @@ scheduler(void)
   for(;;){
     // Avoid deadlock by ensuring that devices can interrupt.
     intr_on();
-
+    
+    int found = 0;
     for(p = proc; p < &proc[NPROC]; p++) {
       acquire(&p->lock);
       if(p->state == RUNNABLE) {
@@ -475,14 +560,33 @@ scheduler(void)
         // before jumping back to us.
         p->state = RUNNING;
         c->proc = p;
+
+        // 切换到独立的内核页表
+        w_satp(MAKE_SATP(p->k_pagetable1));
+        // 刷新 TLB
+        sfence_vma();
+
         swtch(&c->context, &p->context);
+
+        // 切换回全局内核页表
+        kvminithart();
 
         // Process is done running for now.
         // It should have changed its p->state before coming back.
         c->proc = 0;
+
+        found = 1;
       }
       release(&p->lock);
     }
+#if !defined (LAB_FS)
+    if(found == 0) {
+      intr_on();
+      asm volatile("wfi");
+    }
+#else
+    ;
+#endif
   }
 }
 
@@ -558,9 +662,10 @@ sleep(void *chan, struct spinlock *lk)
   // guaranteed that we won't miss any wakeup
   // (wakeup locks p->lock),
   // so it's okay to release lk.
-
-  acquire(&p->lock);  //DOC: sleeplock1
-  release(lk);
+  if(lk != &p->lock){  //DOC: sleeplock0
+    acquire(&p->lock);  //DOC: sleeplock1
+    release(lk);
+  }
 
   // Go to sleep.
   p->chan = chan;
@@ -572,8 +677,10 @@ sleep(void *chan, struct spinlock *lk)
   p->chan = 0;
 
   // Reacquire original lock.
-  release(&p->lock);
-  acquire(lk);
+  if(lk != &p->lock){
+    release(&p->lock);
+    acquire(lk);
+  }
 }
 
 // Wake up all processes sleeping on chan.
@@ -584,13 +691,23 @@ wakeup(void *chan)
   struct proc *p;
 
   for(p = proc; p < &proc[NPROC]; p++) {
-    if(p != myproc()){
-      acquire(&p->lock);
-      if(p->state == SLEEPING && p->chan == chan) {
-        p->state = RUNNABLE;
-      }
-      release(&p->lock);
+    acquire(&p->lock);
+    if(p->state == SLEEPING && p->chan == chan) {
+      p->state = RUNNABLE;
     }
+    release(&p->lock);
+  }
+}
+
+// Wake up p if it is sleeping in wait(); used by exit().
+// Caller must hold p->lock.
+static void
+wakeup1(struct proc *p)
+{
+  if(!holding(&p->lock))
+    panic("wakeup1");
+  if(p->chan == p && p->state == SLEEPING) {
+    p->state = RUNNABLE;
   }
 }
 
